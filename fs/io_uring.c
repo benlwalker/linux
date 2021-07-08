@@ -78,6 +78,7 @@
 #include <linux/task_work.h>
 #include <linux/pagemap.h>
 #include <linux/io_uring.h>
+#include <linux/dmaengine.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/io_uring.h>
@@ -405,6 +406,8 @@ struct io_ring_ctx {
 	struct io_rsrc_data	*file_data;
 	struct io_file_table	file_table;
 	unsigned		nr_user_files;
+
+	struct dma_chan		*dma_chan;
 
 	/* if used, fixed mapped user buffers */
 	struct io_rsrc_data	*buf_data;
@@ -3246,6 +3249,18 @@ static int io_iter_do_read(struct io_kiocb *req, struct iov_iter *iter)
 		return loop_rw_iter(READ, req, iter);
 	else
 		return -EINVAL;
+}
+
+static struct dma_chan *io_dma_get_chan(void)
+{
+	dma_cap_mask_t msk;
+	struct dma_chan *chn;
+
+	dma_cap_zero(msk);
+	dma_cap_set(DMA_MEMCPY, msk);
+
+	chn = dma_request_chan_by_mask(&msk);
+	return IS_ERR(chn) ? NULL : chn;
 }
 
 static int io_read(struct io_kiocb *req, unsigned int issue_flags)
@@ -8123,6 +8138,11 @@ static void io_buffer_unmap(struct io_ring_ctx *ctx, struct io_mapped_ubuf **slo
 	struct io_mapped_ubuf *imu = *slot;
 	unsigned int i;
 
+	if (ctx->dma_chan != NULL) {
+		dma_release_channel(ctx->dma_chan);
+		ctx->dma_chan = NULL;
+	}
+
 	if (imu != ctx->dummy_ubuf) {
 		for (i = 0; i < imu->nr_bvecs; i++)
 			unpin_user_page(imu->bvec[i].bv_page);
@@ -8441,8 +8461,11 @@ static int io_sqe_buffers_register(struct io_ring_ctx *ctx, void __user *arg,
 	ctx->buf_data = data;
 	if (ret)
 		__io_sqe_buffers_unregister(ctx);
-	else
+	else {
+		ctx->dma_chan = io_dma_get_chan();
 		io_rsrc_node_switch(ctx, NULL);
+	}
+
 	return ret;
 }
 
