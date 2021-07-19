@@ -2711,6 +2711,7 @@ static int io_prep_rw(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	    req->opcode == IORING_OP_WRITE_FIXED) {
 		req->imu = NULL;
 		io_req_set_rsrc_node(req);
+		kiocb->ki_dma_chan = ctx->dma_chan;
 	}
 
 	req->rw.addr = READ_ONCE(sqe->addr);
