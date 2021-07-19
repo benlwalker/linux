@@ -580,7 +580,7 @@ struct io_sr_msg {
 	union {
 		struct compat_msghdr __user	*umsg_compat;
 		struct user_msghdr __user	*umsg;
-		void __user			*buf;
+		u64				addr;
 	};
 	int				msg_flags;
 	int				bgid;
@@ -1034,6 +1034,11 @@ static const struct io_op_def io_op_defs[] = {
 	},
 	[IORING_OP_RENAMEAT] = {},
 	[IORING_OP_UNLINKAT] = {},
+	[IORING_OP_SEND_FIXED] = {
+		.needs_file		= 1,
+		.unbound_nonreg_file	= 1,
+		.pollout		= 1,
+	},
 };
 
 static bool io_disarm_next(struct io_kiocb *req);
@@ -2782,9 +2787,17 @@ static void kiocb_done(struct kiocb *kiocb, ssize_t ret,
 static int __io_import_fixed(struct io_kiocb *req, int rw, struct iov_iter *iter,
 			     struct io_mapped_ubuf *imu)
 {
-	size_t len = req->rw.len;
-	u64 buf_end, buf_addr = req->rw.addr;
+	size_t len;
+	u64 buf_end, buf_addr;
 	size_t offset;
+
+	if (req->opcode == IORING_OP_SEND_FIXED) {
+		len = req->sr_msg.len;
+		buf_addr = req->sr_msg.addr;
+	} else {
+		len = req->rw.len;
+		buf_addr = req->rw.addr;
+	}
 
 	if (unlikely(check_add_overflow(buf_addr, (u64)len, &buf_end)))
 		return -EFAULT;
@@ -4346,6 +4359,9 @@ static int io_sendmsg_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (unlikely(req->ctx->flags & IORING_SETUP_IOPOLL))
 		return -EINVAL;
 
+	if (sqe->opcode == IORING_OP_SEND_FIXED)
+		req->buf_index = READ_ONCE(sqe->buf_index);
+
 	sr->umsg = u64_to_user_ptr(READ_ONCE(sqe->addr));
 	sr->len = READ_ONCE(sqe->len);
 	sr->msg_flags = READ_ONCE(sqe->msg_flags) | MSG_NOSIGNAL;
@@ -4415,7 +4431,12 @@ static int io_send(struct io_kiocb *req, unsigned int issue_flags)
 	if (unlikely(!sock))
 		return -ENOTSOCK;
 
-	ret = import_single_range(WRITE, sr->buf, sr->len, &iov, &msg.msg_iter);
+	if (req->opcode == IORING_OP_SEND_FIXED) {
+		ret = io_import_fixed(req, WRITE, &msg.msg_iter);
+	} else {
+		ret = import_single_range(WRITE, u64_to_user_ptr(sr->addr), sr->len, &iov, &msg.msg_iter);
+	}
+
 	if (unlikely(ret))
 		return ret;
 
@@ -4441,6 +4462,7 @@ static int io_send(struct io_kiocb *req, unsigned int issue_flags)
 		req_set_fail_links(req);
 	__io_req_complete(req, issue_flags, ret, 0);
 	return 0;
+
 }
 
 static int __io_recvmsg_copy_hdr(struct io_kiocb *req,
@@ -4643,7 +4665,7 @@ static int io_recv(struct io_kiocb *req, unsigned int issue_flags)
 	struct io_buffer *kbuf;
 	struct io_sr_msg *sr = &req->sr_msg;
 	struct msghdr msg;
-	void __user *buf = sr->buf;
+	void __user *buf = u64_to_user_ptr(sr->addr);
 	struct socket *sock;
 	struct iovec iov;
 	unsigned flags;
@@ -5912,6 +5934,7 @@ static int io_req_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		return io_sfr_prep(req, sqe);
 	case IORING_OP_SENDMSG:
 	case IORING_OP_SEND:
+	case IORING_OP_SEND_FIXED:
 		return io_sendmsg_prep(req, sqe);
 	case IORING_OP_RECVMSG:
 	case IORING_OP_RECV:
@@ -6156,6 +6179,7 @@ static int io_issue_sqe(struct io_kiocb *req, unsigned int issue_flags)
 		ret = io_sendmsg(req, issue_flags);
 		break;
 	case IORING_OP_SEND:
+	case IORING_OP_SEND_FIXED:
 		ret = io_send(req, issue_flags);
 		break;
 	case IORING_OP_RECVMSG:
